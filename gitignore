@@ -1,0 +1,41 @@
+# ----------------------------------------------------------------------
+# Data (never committed) — external downloads and intermediate CSVs.
+# Keep the empty directories via their .gitkeep placeholders.
+# ----------------------------------------------------------------------
+data/raw/*
+data/processed/*
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+
+# ----------------------------------------------------------------------
+# Licensed model output (never committed): every theoretical-prices file
+# retains C_LAST (licensed market option price) and UNDERLYING_LAST.
+# The small aggregate accuracy/result tables ARE committed (not matched here).
+# ----------------------------------------------------------------------
+outputs/**/*theoretical_prices*.csv
+
+# ----------------------------------------------------------------------
+# Python
+# ----------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+
+# ----------------------------------------------------------------------
+# Virtual environments
+# ----------------------------------------------------------------------
+.venv/
+venv/
+env/
+ENV/
+
+# ----------------------------------------------------------------------
+# OS / editor
+# ----------------------------------------------------------------------
+.DS_Store
+Thumbs.db
+desktop.ini
+.idea/
+.vscode/
+*.swp
