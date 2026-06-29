@@ -1,133 +1,300 @@
 """
-Script: Merging the Option Dataset with the SOFR Interest Rate
---------------------------------------------------------------
-Merges the consolidated option dataset (script 1) with Secured
-Overnight Financing Rate (SOFR) data, which serves as the proxy for
-the risk-free rate (r).
+SPX Option Dataset Filtering Script
+-----------------------------------
+Applies a series of data-quality and economic filters to the option
+dataset to produce a clean research sample ready for use in model
+estimation.
 
-Merge strategy:
-    Uses pd.merge_asof with direction='backward' so that each
-    QUOTE_DATE is paired with the most recent SOFR rate in effect on
-    or before that date. This approach automatically handles holidays
-    and non-business days without manual forward-filling.
+Filtering stages:
+    0. Data quality      : drop rows with missing values, non-positive
+                           values, or invalid dates.
+    1. Time to maturity  : compute TTM in days; keep 7 ≤ TTM ≤ 365.
+    2. Minimum price      : C_LAST ≥ 0.375 (remove tick noise).
+    3. No-arbitrage      : C > max(S − K·e^(−rT), 0).
+    4. Moneyness         : 0.8 ≤ S/K ≤ 1.2.
 
-    If a QUOTE_DATE is earlier than the oldest SOFR observation, the
-    row is filled with the first SOFR value as a fallback (with a
-    report of the number of affected rows).
+After all filters are applied, the dataset is labeled with a moneyness
+classification (ITM / ATM / OTM) based on the S/K ratio, and the
+composition of each category is reported to the console. The S_over_K
+and MONEYNESS columns are included in the output file so that downstream
+analysis does not need to recompute them.
+
+Each filtering stage is reported explicitly: the number of rows dropped,
+the percentage, and the rows remaining after the filter.
 """
 
 import os
 import pandas as pd
+import numpy as np
 
 
 # ============================================================
 # 1. CONFIGURATION
 # ============================================================
 
-# Input: output of script 01_combine_options_data.py
-INPUT_OPTIONS = os.path.join("data", "processed", "options_dataset_final.csv")
+INPUT_FILE  = os.path.join("data", "processed", "options_with_sofr.csv")
+OUTPUT_FILE = os.path.join("data", "processed", "options_dataset_filtered.csv")
 
-# Input: SOFR data from the official source (New York Fed)
-INPUT_SOFR    = os.path.join("data", "raw", "SOFR.csv")
+# Set to False to inspect the filter log without saving the file.
+SAVE_OUTPUT = True
 
-# Output
-OUTPUT_FILE   = os.path.join("data", "processed", "options_with_sofr.csv")
+# Numeric columns that must be populated (non-NaN).
+REQUIRED_NUM_COLS = ["C_LAST", "UNDERLYING_LAST", "STRIKE", "r"]
+
+# Filter parameters (easy to change for sensitivity analysis).
+TTM_MIN        = 7       # days
+TTM_MAX        = 365     # days
+PRICE_MIN      = 0.375   # minimum option price threshold
+MONEYNESS_LOW  = 0.8     # lower bound on S/K
+MONEYNESS_HIGH = 1.2     # upper bound on S/K
+
+# Moneyness classification parameters (S/K ratio).
+ITM_THRESHOLD = 1.05   # S/K > 1.05           -> ITM
+ATM_LOW       = 0.97   # 0.97 ≤ S/K ≤ 1.05    -> ATM
+ATM_HIGH      = 1.05   # S/K < 0.97           -> OTM
 
 
 # ============================================================
-# 2. DATA-READING & CLEANING FUNCTIONS
+# 2. REPORTING UTILITY
 # ============================================================
 
-def load_sofr(path):
+def report_filter(label, n_before, df_after):
+    """Print a summary of the impact of one filtering stage."""
+    n_after = len(df_after)
+    dropped = n_before - n_after
+    pct = (dropped / n_before * 100) if n_before > 0 else 0.0
+    print(f"  [{label}] dropped: {dropped:,} ({pct:.2f}%) | remaining: {n_after:,}")
+    return df_after
+
+
+# ============================================================
+# 3. FILTER FUNCTIONS
+# ============================================================
+
+def coerce_types(df):
+    """Coerce the correct data types on the date and numeric columns."""
+    df["QUOTE_DATE"]  = pd.to_datetime(df["QUOTE_DATE"],  errors="coerce")
+    df["EXPIRE_DATE"] = pd.to_datetime(df["EXPIRE_DATE"], errors="coerce")
+    for col in REQUIRED_NUM_COLS:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    return df
+
+
+def apply_data_quality_filters(df):
     """
-    Load SOFR data and standardize it into two columns:
-        - 'Effective Date' : datetime type
-        - 'r'              : interest rate in decimal form
+    Stage 0 — Data-quality filter:
+        - Drop rows with invalid dates (NaT).
+        - Drop rows with missing values in the essential numeric columns.
+        - Drop rows with UNDERLYING_LAST ≤ 0 or STRIKE ≤ 0.
+        - Drop rows with C_LAST < 0 (anomalous data).
     """
-    sofr = pd.read_csv(path, delimiter=";", decimal=",")
-    sofr.columns = sofr.columns.str.strip()
+    print("\nStage 0: Data-quality filter")
 
-    sofr["Effective Date"] = pd.to_datetime(sofr["Effective Date"])
+    n = len(df)
+    df = df.dropna(subset=["QUOTE_DATE", "EXPIRE_DATE"])
+    df = report_filter("Invalid dates (NaT)", n, df)
 
-    # Numeric coercion; invalid values are forced to NaN.
-    sofr["r"] = pd.to_numeric(sofr["Rate (%)"], errors="coerce") / 100
+    n = len(df)
+    df = df.dropna(subset=REQUIRED_NUM_COLS)
+    df = report_filter("NaN in numeric columns", n, df)
 
-    sofr = sofr[["Effective Date", "r"]].dropna()
-    sofr = sofr.sort_values("Effective Date").reset_index(drop=True)
-    return sofr
+    n = len(df)
+    df = df[df["UNDERLYING_LAST"] > 0]
+    df = report_filter("UNDERLYING_LAST ≤ 0", n, df)
+
+    n = len(df)
+    df = df[df["STRIKE"] > 0]
+    df = report_filter("STRIKE ≤ 0", n, df)
+
+    n = len(df)
+    df = df[df["C_LAST"] >= 0]
+    df = report_filter("C_LAST < 0", n, df)
+
+    return df
 
 
-def load_options(path):
-    """Load the option dataset and ensure QUOTE_DATE is of datetime type."""
-    df = pd.read_csv(path)
-    df["QUOTE_DATE"] = pd.to_datetime(df["QUOTE_DATE"])
+def apply_ttm_filter(df):
+    """
+    Stage 1 — Compute Time to Maturity (TTM) in days and apply the
+    constraint TTM_MIN ≤ TTM ≤ TTM_MAX.
+    """
+    print(f"\nStage 1: Time-to-maturity filter ({TTM_MIN}–{TTM_MAX} days)")
+
+    df["TIME_TO_MATURITY"] = (df["EXPIRE_DATE"] - df["QUOTE_DATE"]).dt.days
+
+    # Drop contracts that have already expired or mature today.
+    n = len(df)
+    df = df[df["TIME_TO_MATURITY"] > 0]
+    df = report_filter("TTM ≤ 0 (expired)", n, df)
+
+    # Apply the TTM range.
+    n = len(df)
+    below = (df["TIME_TO_MATURITY"] < TTM_MIN).sum()
+    above = (df["TIME_TO_MATURITY"] > TTM_MAX).sum()
+    print(f"  TTM distribution before filter: "
+          f"<{TTM_MIN}: {below:,} | >{TTM_MAX}: {above:,} | "
+          f"within range: {n - below - above:,}")
+
+    df = df[
+        (df["TIME_TO_MATURITY"] >= TTM_MIN) &
+        (df["TIME_TO_MATURITY"] <= TTM_MAX)
+    ]
+    df = report_filter(f"TTM outside {TTM_MIN}–{TTM_MAX}", n, df)
+
+    return df
+
+
+def apply_price_filter(df):
+    """
+    Stage 2 — Remove contracts whose price is too low (tick noise):
+    C_LAST < PRICE_MIN.
+    """
+    print(f"\nStage 2: Minimum-price filter (C_LAST ≥ {PRICE_MIN})")
+
+    n = len(df)
+    df = df[df["C_LAST"] >= PRICE_MIN]
+    df = report_filter(f"C_LAST < {PRICE_MIN}", n, df)
+
+    return df
+
+
+def apply_no_arbitrage_filter(df):
+    """
+    Stage 3 — No-arbitrage lower bound for European call options:
+        C > max(S − K·e^(−rT), 0)
+    Rows that violate this bound indicate anomalous data or recording
+    errors.
+    """
+    print("\nStage 3: No-arbitrage lower-bound filter")
+
+    n = len(df)
+    T_years = df["TIME_TO_MATURITY"] / 365
+    lower_bound = np.maximum(
+        df["UNDERLYING_LAST"] - df["STRIKE"] * np.exp(-df["r"] * T_years),
+        0,
+    )
+    df = df[df["C_LAST"] > lower_bound]
+    df = report_filter("No-arbitrage lower-bound violation", n, df)
+
+    return df
+
+
+def apply_moneyness_filter(df):
+    """
+    Stage 4 — Restrict moneyness (S/K) to the range
+    MONEYNESS_LOW ≤ S/K ≤ MONEYNESS_HIGH to remove illiquid
+    deep-in-the-money and deep-out-of-the-money options.
+    """
+    print(f"\nStage 4: Moneyness filter "
+          f"({MONEYNESS_LOW} ≤ S/K ≤ {MONEYNESS_HIGH})")
+
+    n = len(df)
+    moneyness = df["UNDERLYING_LAST"] / df["STRIKE"]
+    df = df[(moneyness >= MONEYNESS_LOW) & (moneyness <= MONEYNESS_HIGH)]
+    df = report_filter("Moneyness outside range", n, df)
+
     return df
 
 
 # ============================================================
-# 3. MERGE FUNCTION
+# 4. MONEYNESS CLASSIFICATION (POST-FILTER)
 # ============================================================
 
-def merge_with_sofr(options, sofr):
+def classify_moneyness(df):
     """
-    Merge the option table with the SOFR table using an as-of join
-    (direction='backward'). For each QUOTE_DATE, the most recent SOFR
-    rate in effect on or before that date is taken.
+    Moneyness classification based on the S/K ratio:
+        - ITM : S/K > ITM_THRESHOLD
+        - ATM : ATM_LOW ≤ S/K ≤ ATM_HIGH
+        - OTM : S/K < ATM_LOW
 
-    If a QUOTE_DATE is earlier than the oldest SOFR observation, the
-    first SOFR value is used as a fallback, with an explicit report.
+    Adds the 'S_over_K' and 'MONEYNESS' columns to the dataframe, then
+    reports the composition of each category. This step is analytical —
+    no rows are dropped.
     """
-    # merge_asof requires both tables to be sorted on the merge key.
-    options_sorted = options.sort_values("QUOTE_DATE").reset_index(drop=True)
+    print("\nMoneyness classification (ITM / ATM / OTM)")
 
-    merged = pd.merge_asof(
-        options_sorted,
-        sofr.rename(columns={"Effective Date": "_rate_date"}),
-        left_on="QUOTE_DATE",
-        right_on="_rate_date",
-        direction="backward",
-    )
-    merged = merged.drop(columns=["_rate_date"])
+    df = df.copy()
+    df["S_over_K"] = df["UNDERLYING_LAST"] / df["STRIKE"]
 
-    # Fallback: rows with a QUOTE_DATE earlier than the oldest SOFR.
-    n_before_sofr = int(merged["r"].isna().sum())
-    if n_before_sofr > 0:
-        fallback_rate = float(sofr["r"].iloc[0])
-        merged["r"] = merged["r"].fillna(fallback_rate)
-        print(
-            f"Note: {n_before_sofr:,} rows have a QUOTE_DATE before the "
-            f"oldest SOFR observation; filled with the first SOFR value "
-            f"(r = {fallback_rate:.6f})."
-        )
+    conditions = [
+        df["S_over_K"] > ITM_THRESHOLD,
+        (df["S_over_K"] >= ATM_LOW) & (df["S_over_K"] <= ATM_HIGH),
+        df["S_over_K"] < ATM_LOW,
+    ]
+    labels = ["ITM", "ATM", "OTM"]
+    df["MONEYNESS"] = np.select(conditions, labels, default="UNK")
 
-    return merged
+    total = len(df)
+    itm = int((df["MONEYNESS"] == "ITM").sum())
+    atm = int((df["MONEYNESS"] == "ATM").sum())
+    otm = int((df["MONEYNESS"] == "OTM").sum())
+    pct = lambda n: (n / total * 100) if total > 0 else 0.0
+
+    print(f"  Total options                            : {total:,}")
+    print(f"  ITM (S/K > {ITM_THRESHOLD})            : "
+          f"{itm:,} ({pct(itm):.2f}%)")
+    print(f"  ATM ({ATM_LOW} ≤ S/K ≤ {ATM_HIGH})     : "
+          f"{atm:,} ({pct(atm):.2f}%)")
+    print(f"  OTM (S/K < {ATM_LOW})                  : "
+          f"{otm:,} ({pct(otm):.2f}%)")
+    print(f"  Check count (ITM + ATM + OTM)          : {itm + atm + otm:,}")
+
+    return df
 
 
 # ============================================================
-# 4. MAIN PIPELINE
+# 5. MAIN PIPELINE
 # ============================================================
 
 def main():
-    print("--- Loading data ---")
-    options = load_options(INPUT_OPTIONS)
-    sofr    = load_sofr(INPUT_SOFR)
+    print("=== SPX Option Dataset Filtering ===")
 
-    print(f"Option rows       : {options.shape[0]:,}")
-    print(f"SOFR observations : {sofr.shape[0]:,}")
-    print(f"SOFR range        : "
-          f"{sofr['Effective Date'].min().date()} to "
-          f"{sofr['Effective Date'].max().date()}")
+    df = pd.read_csv(INPUT_FILE)
+    n_awal = len(df)
+    print(f"Initial rows: {n_awal:,}")
 
-    print("\n--- Merging options + SOFR (as-of backward) ---")
-    merged = merge_with_sofr(options, sofr)
+    # Coerce data types.
+    df = coerce_types(df)
 
-    print("\n--- Saving result ---")
-    os.makedirs(os.path.dirname(OUTPUT_FILE), exist_ok=True)
-    merged.to_csv(OUTPUT_FILE, index=False)
+    # Apply filters sequentially.
+    df = apply_data_quality_filters(df)
+    df = apply_ttm_filter(df)
+    df = apply_price_filter(df)
+    df = apply_no_arbitrage_filter(df)
+    df = apply_moneyness_filter(df)
 
-    print(f"Output file       : {OUTPUT_FILE}")
-    print(f"Total rows        : {merged.shape[0]:,}")
-    print(f"NaNs in column r  : {merged['r'].isna().sum():,}")
+    # Drop the EXPIRE_DATE column (its information is already represented in TTM).
+    df = df.drop(columns=["EXPIRE_DATE"])
+
+    # Classify moneyness on the post-filter sample.
+    df = classify_moneyness(df)
+
+    # Final summary.
+    n_akhir = len(df)
+    pct_retained = (n_akhir / n_awal * 100) if n_awal > 0 else 0.0
+    print("\n=== Summary ===")
+    print(f"Initial rows        : {n_awal:,}")
+    print(f"Final rows          : {n_akhir:,} ({pct_retained:.2f}% retained)")
+    print(f"S  (min / max)      : "
+          f"{df['UNDERLYING_LAST'].min():.2f} / {df['UNDERLYING_LAST'].max():.2f}")
+    print(f"K  (min / max)      : "
+          f"{df['STRIKE'].min():.2f} / {df['STRIKE'].max():.2f}")
+    print(f"TTM (min / max)     : "
+          f"{df['TIME_TO_MATURITY'].min()} / {df['TIME_TO_MATURITY'].max()} days")
+    print(f"r  (min / max)      : "
+          f"{df['r'].min():.6f} / {df['r'].max():.6f}")
+    print(f"S/K (min / max)     : "
+          f"{df['S_over_K'].min():.4f} / {df['S_over_K'].max():.4f}")
+
+    # Save / skip.
+    if SAVE_OUTPUT:
+        os.makedirs(os.path.dirname(OUTPUT_FILE), exist_ok=True)
+        df.to_csv(OUTPUT_FILE, index=False)
+        print(f"\nFile saved          : {OUTPUT_FILE}")
+    else:
+        print("\nInspection mode: file NOT saved.")
+
+    print("Filtering complete.")
 
 
 if __name__ == "__main__":
