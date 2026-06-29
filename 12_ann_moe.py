@@ -95,6 +95,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import TensorDataset, DataLoader
 from sklearn.preprocessing import StandardScaler
+from tqdm import tqdm
 
 
 # ============================================================
@@ -476,7 +477,8 @@ def train_one_model(seed, X_train_s, y_train, X_val_s, y_val,
     best_state    = None
     no_improve    = 0
 
-    for epoch in range(1, EPOCHS + 1):
+    epoch_bar = tqdm(range(1, EPOCHS + 1), desc=f"Training seed {seed}", unit="epoch", leave=False)
+    for epoch in epoch_bar:
         # --- Train ---
         model.train()
         train_losses = []
@@ -503,7 +505,7 @@ def train_one_model(seed, X_train_s, y_train, X_val_s, y_val,
 
         if epoch % 10 == 0 or epoch == 1:
             lr = optimizer.param_groups[0]["lr"]
-            print(f"    Epoch {epoch:03d} | "
+            epoch_bar.write(f"    Epoch {epoch:03d} | "
                   f"Train: {train_loss:.6f} | "
                   f"Val: {val_loss:.6f} | LR: {lr:.2e}")
 
@@ -515,9 +517,10 @@ def train_one_model(seed, X_train_s, y_train, X_val_s, y_val,
         else:
             no_improve += 1
             if no_improve >= PATIENCE:
-                print(f"    Early stopping at epoch {epoch}.")
+                epoch_bar.write(f"    Early stopping at epoch {epoch}.")
                 break
 
+    epoch_bar.close()
     if best_state is not None:
         model.load_state_dict(best_state)
 
