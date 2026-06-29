@@ -41,6 +41,7 @@ import pandas as pd
 import torch
 from scipy.optimize import minimize
 from scipy.stats import norm
+from tqdm import tqdm
 
 
 # ============================================================
@@ -209,14 +210,15 @@ def mc_merton_jd(df, params, device):
     mcjd_prices = {vol: np.zeros(n, dtype=np.float32) for vol in VOL_COLS}
     num_batches = math.ceil(n / BATCH_SIZE)
 
-    for b in range(num_batches):
+    # Progress bar over the option batches (the long-running stage).
+    progress = tqdm(range(num_batches), desc="Monte Carlo simulation", unit="batch")
+    for b in progress:
         i0 = b * BATCH_SIZE
         i1 = min(i0 + BATCH_SIZE, n)
         B  = i1 - i0
 
-        if (b + 1) % 50 == 0 or b == 0 or b == num_batches - 1:
-            print(f"  Batch {b+1}/{num_batches} "
-                  f"(rows {i0}–{i1-1})")
+        # Live status: row range currently being simulated.
+        progress.set_postfix_str(f"rows {i0}–{i1-1}")
 
         # Input tensors (1, B) -> broadcast to (N_PATHS, B)
         S0    = torch.tensor(S_all[i0:i1], device=device).unsqueeze(0)
